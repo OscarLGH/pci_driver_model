@@ -2,6 +2,8 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/pci.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
 
 #include "pci_driver.h"
 
@@ -31,20 +33,84 @@ static irqreturn_t pci_driver_irq_check(int irq, void *data)
 	return IRQ_WAKE_THREAD;//IRQ_NONE
 }
 
+static int pci_driver_model_proc_open(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+static ssize_t pci_driver_model_proc_write(struct file *filp, const char __user *buffer,
+			size_t count, loff_t *ppos)
+{
+	return count;
+}
+
+static ssize_t pci_driver_model_proc_read(struct file *filp, char __user *buffer,
+			size_t count, loff_t *ppos)
+{
+	int index;
+	u32 *bar_ptr;
+	struct pci_driver_model *dev = PDE_DATA(file_inode(filp));
+	sscanf(filp->f_path.dentry->d_iname, "bar%d", &index);
+	bar_ptr = dev->regs[index].virt;
+
+	if (*ppos > dev->regs[index].size)
+		return -EFAULT;
+
+	if (bar_ptr == NULL)
+		return -EFAULT;
+
+	copy_to_user(buffer, bar_ptr, count);
+	return count;
+}
+
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+static loff_t pci_driver_model_proc_lseek(struct file *filp, loff_t offset, int origin)
+{
+	int index;
+	loff_t retval = 0;
+	struct pci_driver_model *dev = PDE_DATA(file_inode(filp));
+	sscanf(filp->f_path.dentry->d_iname, "bar%d", &index);
+
+	switch (origin) {
+		case SEEK_SET:
+			offset += filp->f_pos;
+			retval = offset;
+			break;
+		case SEEK_END:
+			retval = dev->regs[index].size;
+			break;
+		default:
+			break;
+			
+	}
+	return retval;
+}
+
+static const struct file_operations pci_driver_model_fops = {
+	.open = pci_driver_model_proc_open,
+	.read = pci_driver_model_proc_read,
+	.write = pci_driver_model_proc_write,
+	.llseek = pci_driver_model_proc_lseek,
+};
+
+
 static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_id *pent)
 {
-	u16 vid, did;
 	u64 bar_base, bar_len;
 	int ret;
 	struct pci_driver_model *drv_data = NULL;
 	int i;
+	char buffer[256];
 
 	drv_data = kmalloc(sizeof(*drv_data), GFP_KERNEL);
 	if (drv_data == NULL) {
 		return -ENOMEM;
 	}
+	memset(drv_data, 0, sizeof(*drv_data));
 
 	pci_set_drvdata(pdev, drv_data);
+	drv_data->pdev = pdev;
 
 	printk("%s\n", __FUNCTION__);
 	ret = pci_enable_device(pdev);
@@ -55,36 +121,61 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 
 	pci_set_master(pdev);
 
-	ret = pci_enable_msi(pdev);
-	if (ret) {
-		printk("enabling MSI failed.\n");
+	if (0) {
+		ret = pci_enable_msi(pdev);
+		if (ret) {
+			printk("enabling MSI failed.\n");
+		}
+
+		ret = pci_request_irq(pdev, pdev->irq, pci_driver_irq_check, pci_driver_irq, pci_get_drvdata(pdev), "pci_driver_irq %d", pdev->irq);
+		if (ret) {
+			printk("request irq failed.\n");
+			return ret;
+		}
 	}
 
-	ret = pci_request_irq(pdev, pdev->irq, pci_driver_irq_check, pci_driver_irq, pci_get_drvdata(pdev), "pci_driver_irq %d", pdev->irq);
-	if (ret) {
-		printk("request irq failed.\n");
-		return ret;
-	}
+	printk("PCI vendor ID:%04x, PCI device ID:%04x\n", pdev->vendor, pdev->device);
 
-	pci_read_config_word(pdev, 0x0, &vid);
-	pci_read_config_word(pdev, 0x2, &did);
-	printk("PCI vendor ID:%04x, PCI device ID:%04x\n", vid, did);
+	sprintf(buffer, "pci_%02x:%02x.%02x_%04x%04x", pdev->bus->number, pdev->devfn >> 8, pdev->devfn, pdev->vendor, pdev->device);
+	drv_data->device_proc_entry = proc_mkdir(buffer, NULL);
 	for (i = 0; i < 6; i++) {
 		bar_base = pci_resource_start(pdev, i);
 		bar_len = pci_resource_len(pdev, i);
 		printk("BAR%d:base = 0x%08llx, len = 0x%llx\n", i, bar_base, bar_len);
-		if (pci_resource_start(pdev, i) != 0) {
-			drv_data->regs[i] = ioremap(bar_base, bar_len);
-			printk("BAR%d[0x0] = %08x\n", i, drv_data->regs[i][0]);
-		}
+		drv_data->regs[i].phys = bar_base;
+		drv_data->regs[i].size = bar_len;
+		if (bar_len != 0)
+			drv_data->regs[i].virt = ioremap(bar_base, bar_len);
+
+		sprintf(buffer, "bar%d", i);
+		drv_data->regs[i].bar_proc_entry = proc_create_data(buffer, 0755, drv_data->device_proc_entry, &pci_driver_model_fops, drv_data);
 	}
 
 	return 0;
 }
 
+static void pci_driver_model_cleanup(struct pci_driver_model *drv_data)
+{
+	int i;
+	char buffer[256];
+	dev_t devno = MKDEV(250, 0);
+	struct pci_dev *pdev = drv_data->pdev;
+	for (i = 0; i < 6; i++) {
+		if (drv_data->regs[i].bar_proc_entry != NULL) {
+			sprintf(buffer, "bar%d", i);
+			remove_proc_entry(buffer, drv_data->device_proc_entry);
+		}
+	}
+	sprintf(buffer, "pci_%02x:%02x.%02x_%04x%04x", pdev->bus->number, pdev->devfn >> 8, pdev->devfn, pdev->vendor, pdev->device);
+	remove_proc_entry(buffer, NULL);
+	unregister_chrdev_region(devno, 6);
+}
+
 static void pci_driver_model_remove(struct pci_dev *pdev)
 {
-	printk("%s\n", __FUNCTION__);
+	struct pci_driver_model *drv_data = pci_get_drvdata(pdev);
+	pci_driver_model_cleanup(drv_data);
+	kfree(drv_data);
 }
 
 static struct pci_driver
