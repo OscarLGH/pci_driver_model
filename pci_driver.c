@@ -118,11 +118,29 @@ static loff_t pci_driver_model_proc_lseek(struct file *filp, loff_t offset, int 
 	return retval;
 }
 
+static int pci_driver_model_proc_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	size_t size = vma->vm_end - vma->vm_start;
+	int index;
+	struct pci_driver_model *dev = PDE_DATA(file_inode(filp));
+	sscanf(filp->f_path.dentry->d_iname, "bar%d", &index);
+	pgprot_noncached(vma->vm_page_prot);
+	if (remap_pfn_range(vma,
+			vma->vm_start,
+			vma->vm_pgoff + dev->regs[index].phys / PAGE_SIZE,
+			size,
+			vma->vm_page_prot)) {
+		return -EAGAIN;
+	}
+	return 0;
+}
+
 static const struct file_operations pci_driver_model_fops = {
 	.open = pci_driver_model_proc_open,
 	.read = pci_driver_model_proc_read,
 	.write = pci_driver_model_proc_write,
 	.llseek = pci_driver_model_proc_lseek,
+	.mmap = pci_driver_model_proc_mmap,
 };
 
 
