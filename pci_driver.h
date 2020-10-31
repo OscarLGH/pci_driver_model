@@ -1,4 +1,19 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/pci.h>
 #include <linux/proc_fs.h>
+#include <linux/uaccess.h>
+#include <linux/pci_ids.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include <linux/cdev.h>
+#include <linux/proc_fs.h>
+#include <asm/cacheflush.h>
+
+#include <linux/vfio.h>
+#include <linux/mdev.h>
+#include <linux/eventfd.h>
 
 #define PCI_VENDOR_ID_MODEL 0x8086
 #define PCI_DEVICE_ID_MODEL 0x100f
@@ -12,9 +27,17 @@ struct pci_bar_reg {
 };
 struct pci_driver_model {
 	struct pci_dev *pdev;
+	spinlock_t lock;
 	struct pci_bar_reg regs[6];
 	void *oprom;
 	u32 irq_cnt;
 	u32 reserved;
+
+	/* for char dev file */
+	struct cdev cdev;
+	dev_t dev;
+	struct class *class;
+
+	/* for proc dev file */
 	struct proc_dir_entry *device_proc_entry;
 };
