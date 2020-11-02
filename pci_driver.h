@@ -11,9 +11,14 @@
 #include <linux/proc_fs.h>
 #include <asm/cacheflush.h>
 
+#include <linux/dma-mapping.h>
+
 #include <linux/vfio.h>
 #include <linux/mdev.h>
+
 #include <linux/eventfd.h>
+#include <linux/workqueue.h>
+
 
 #define PCI_VENDOR_ID_MODEL 0x8086
 #define PCI_DEVICE_ID_MODEL 0x100f
@@ -33,6 +38,17 @@ struct pci_driver_model {
 	u32 irq_cnt;
 	u32 reserved;
 
+	/* DMA buffer */
+	dma_addr_t dma_buffer;
+	void *dma_buffer_virt;
+	size_t dma_buffer_size;
+
+	/* for eventfd */
+	struct eventfd_ctx *efd_ctx;
+
+	/* work queue for irq buttom half */
+	struct work_struct irq_wq;
+
 	/* for char dev file */
 	struct cdev cdev;
 	dev_t dev;
@@ -41,3 +57,8 @@ struct pci_driver_model {
 	/* for proc dev file */
 	struct proc_dir_entry *device_proc_entry;
 };
+
+/* basic ioctls */
+#define PCI_MODEL_IOCTL_MAGIC 0x5536
+#define PCI_MODEL_IOCTL_GET_BAR_INFO	_IOR(PCI_MODEL_IOCTL_MAGIC, 1, void *)
+#define PCI_MODEL_IOCTL_SET_IRQFD	_IOW(PCI_MODEL_IOCTL_MAGIC, 2, void *)

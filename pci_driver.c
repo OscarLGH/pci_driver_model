@@ -15,6 +15,9 @@ static irqreturn_t pci_driver_irq(int irq, void *data)
 	struct pci_driver_model *drv_data = data;
 	drv_data->irq_cnt++;
 	printk("IRQ:%d\n", irq);
+
+	if (drv_data->efd_ctx)
+		eventfd_signal(drv_data->efd_ctx, 1);
 	return result;
 }
 
@@ -78,7 +81,11 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 	int ret = 0;
 
 	switch (cmd) {
-		case 1:
+		case PCI_MODEL_IOCTL_GET_BAR_INFO:
+			copy_to_user((void *)arg, dev->regs, sizeof(dev->regs));
+			break;
+		case PCI_MODEL_IOCTL_SET_IRQFD:
+			dev->efd_ctx = eventfd_ctx_fdget(arg);
 			break;
 		default:
 			break;
@@ -104,6 +111,7 @@ static int pci_driver_model_char_mmap(struct file *filp, struct vm_area_struct *
 	}
 	return 0;
 	*/
+	return 0;
 }
 
 static const struct file_operations pci_driver_model_char_fops = {
@@ -262,6 +270,12 @@ static const struct file_operations pci_driver_model_fops = {
 };
 
 
+void irq_work_queue_func(struct work_struct *wq)
+{
+	struct pci_driver_model *drv_data = container_of(wq, struct pci_driver_model, irq_wq);
+	printk("work queue...\n");
+}
+
 static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_id *pent)
 {
 	u64 bar_base, bar_len;
@@ -299,6 +313,11 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 			return ret;
 		}
 	}
+
+	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
+
+	drv_data->dma_buffer_size = 0x1000;
+	drv_data->dma_buffer_virt = dma_alloc_coherent(&drv_data->pdev->dev, drv_data->dma_buffer_size, &drv_data->dma_buffer, GFP_KERNEL);
 
 	pci_driver_model_device_fd_create(drv_data);
 

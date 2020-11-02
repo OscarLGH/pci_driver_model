@@ -82,11 +82,12 @@ static int pci_driver_model_mdev_mmap(struct mdev_device *mdev, struct vm_area_s
 	}
 	return 0;
 	*/
+	return 0;
 }
 
 static void pci_driver_model_mdev_release(struct mdev_device *mdev)
 {
-	return 0;
+
 }
 
 static struct mdev_parent_ops pci_driver_model_vdev_ops = {
