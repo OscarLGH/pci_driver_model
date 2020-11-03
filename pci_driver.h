@@ -28,12 +28,11 @@ struct pci_bar_reg {
 	u64 phys;
 	u32 *virt;
 	long size;
-	struct proc_dir_entry *bar_proc_entry;
 };
 struct pci_driver_model {
 	struct pci_dev *pdev;
 	spinlock_t lock;
-	struct pci_bar_reg regs[6];
+	struct pci_bar_reg bar_regs[6];
 	void *oprom;
 	u32 irq_cnt;
 	u32 reserved;
@@ -42,6 +41,8 @@ struct pci_driver_model {
 	dma_addr_t dma_buffer;
 	void *dma_buffer_virt;
 	size_t dma_buffer_size;
+
+	int irq_count;
 
 	/* for eventfd */
 	struct eventfd_ctx *efd_ctx;
@@ -62,3 +63,7 @@ struct pci_driver_model {
 #define PCI_MODEL_IOCTL_MAGIC 0x5536
 #define PCI_MODEL_IOCTL_GET_BAR_INFO	_IOR(PCI_MODEL_IOCTL_MAGIC, 1, void *)
 #define PCI_MODEL_IOCTL_SET_IRQFD	_IOW(PCI_MODEL_IOCTL_MAGIC, 2, void *)
+#define PCI_MODEL_IOCTL_SET_IRQ	_IOW(PCI_MODEL_IOCTL_MAGIC, 3, void *)
+
+/* vfio-mdev interfaces */
+extern int pci_driver_model_mdev_init(struct device *dev, const void *ops);

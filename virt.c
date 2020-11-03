@@ -104,5 +104,5 @@ static struct mdev_parent_ops pci_driver_model_vdev_ops = {
 
 int pci_driver_model_mdev_init(struct device *dev, const void *ops)
 {
-	return mdev_register_device(dev, &pci_driver_model_vdev_ops);
+	//return mdev_register_device(dev, &pci_driver_model_vdev_ops);
 }

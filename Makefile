@@ -1,4 +1,5 @@
-obj-m :=pci_driver.o virt.o
+obj-m +=pci_driver_model.o
+pci_driver_model-y += pci_driver.o virt.o
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 clean:
