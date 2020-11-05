@@ -1,5 +1,6 @@
 #include "pci_driver.h"
 
+struct class *pci_driver_model_class;
 static struct pci_device_id
 pci_driver_model_id_table[] = {
 	{
@@ -167,15 +168,12 @@ int pci_driver_model_device_fd_create(struct pci_driver_model *pdm_dev)
 		pdev->device
 	);
 	alloc_chrdev_region(&pdm_dev->dev, 0, 255, "pci_driver_model");
-	major = MAJOR(pdm_dev->dev);
-	minor = 0x20;
 
 	cdev_init(&pdm_dev->cdev, &pci_driver_model_char_fops);
 	pdm_dev->cdev.owner = THIS_MODULE;
 	ret = cdev_add(&pdm_dev->cdev, pdm_dev->dev, 1);
 
-	pdm_dev->class = class_create(THIS_MODULE, "pci_driver_model");
-	device_create(pdm_dev->class, NULL, pdm_dev->dev, NULL, buffer);
+	device_create(pci_driver_model_class, NULL, pdm_dev->dev, NULL, buffer);
 	printk("add char file %d:%d for %s\n", major, minor, buffer);
 
 	return 0;
@@ -183,9 +181,7 @@ int pci_driver_model_device_fd_create(struct pci_driver_model *pdm_dev)
 
 int pci_driver_model_device_fd_destory(struct pci_driver_model *pdm_dev)
 {
-	device_destroy(pdm_dev->class, pdm_dev->dev);
-	class_destroy(pdm_dev->class);
-
+	device_destroy(pci_driver_model_class, pdm_dev->dev);
 	return 0;
 }
 
@@ -228,14 +224,8 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 	printk("allocated %d IRQ vectors.\n", ret);
 
 	for (i = 0; i < drv_data->irq_count; i++) {
-		ret = pci_request_irq(pdev,
-			pci_irq_vector(pdev, i),
-			pci_driver_irq_check,
-			pci_driver_irq,
-			pci_get_drvdata(pdev),
-			"pci_driver_irq %d",
-			pdev->irq
-		);
+		ret = request_irq(pci_irq_vector(pdev, i), pci_driver_irq, 0,
+			"pci_driver_irq %d", pci_get_drvdata(pdev));
 	}
 
 	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
@@ -262,7 +252,11 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 
 static void pci_driver_model_remove(struct pci_dev *pdev)
 {
+	int i;
 	struct pci_driver_model *drv_data = pci_get_drvdata(pdev);
+	for (i = 0; i < drv_data->irq_count; i++) {
+		free_irq(pci_irq_vector(pdev, i), pci_get_drvdata(pdev));
+	}
 	pci_driver_model_device_fd_destory(drv_data);
 	pci_free_consistent(drv_data->pdev, drv_data->dma_buffer_size, drv_data->dma_buffer_virt, drv_data->dma_buffer);
 	kfree(drv_data);
@@ -278,12 +272,14 @@ pci_driver_model_driver = {
 
 static int __init pci_driver_init(void)
 {
+	pci_driver_model_class = class_create(THIS_MODULE, "pci_driver_model");
 	return pci_register_driver(&pci_driver_model_driver);
 }
 
 static void __exit pci_driver_exit(void)
 {
 	pci_unregister_driver(&pci_driver_model_driver);
+	class_destroy(pci_driver_model_class);
 }
 
 module_init(pci_driver_init);

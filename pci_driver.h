@@ -53,7 +53,6 @@ struct pci_driver_model {
 	/* for char dev file */
 	struct cdev cdev;
 	dev_t dev;
-	struct class *class;
 
 	/* for proc dev file */
 	struct proc_dir_entry *device_proc_entry;
