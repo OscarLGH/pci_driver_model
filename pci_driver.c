@@ -231,7 +231,7 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
 
 	drv_data->dma_buffer_size = 0x1000;
-	drv_data->dma_buffer_virt = pci_alloc_consistent(drv_data->pdev, drv_data->dma_buffer_size, &drv_data->dma_buffer);
+	drv_data->dma_buffer_virt = dma_alloc_coherent(&drv_data->pdev->dev, drv_data->dma_buffer_size, &drv_data->dma_buffer, GFP_KERNEL);
 
 	pci_driver_model_device_fd_create(drv_data);
 
@@ -245,7 +245,7 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 			drv_data->bar_regs[i].virt = ioremap(bar_base, bar_len);
 	}
 
-	pci_driver_model_mdev_init(&drv_data->pdev->dev, NULL);
+	//pci_driver_model_mdev_init(&drv_data->pdev->dev, NULL);
 
 	return 0;
 }
@@ -258,7 +258,7 @@ static void pci_driver_model_remove(struct pci_dev *pdev)
 		free_irq(pci_irq_vector(pdev, i), pci_get_drvdata(pdev));
 	}
 	pci_driver_model_device_fd_destory(drv_data);
-	pci_free_consistent(drv_data->pdev, drv_data->dma_buffer_size, drv_data->dma_buffer_virt, drv_data->dma_buffer);
+	dma_free_coherent(&drv_data->pdev->dev, drv_data->dma_buffer_size, drv_data->dma_buffer_virt, drv_data->dma_buffer);
 	kfree(drv_data);
 }
 
@@ -272,7 +272,7 @@ pci_driver_model_driver = {
 
 static int __init pci_driver_init(void)
 {
-	pci_driver_model_class = class_create(THIS_MODULE, "pci_driver_model");
+	pci_driver_model_class = class_create("pci_driver_model");
 	return pci_register_driver(&pci_driver_model_driver);
 }
 
