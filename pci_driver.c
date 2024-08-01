@@ -1,12 +1,11 @@
 #include "pci_driver.h"
 
 struct class *pci_driver_model_class;
+u64 device_cnt = 0;
 static struct pci_device_id
 pci_driver_model_id_table[] = {
 	{
 		PCI_DEVICE(PCI_VENDOR_ID_MODEL, PCI_DEVICE_ID_MODEL),
-		.class = PCI_MODEL_BASE_CLASS << 16,
-		.class_mask = 0xff << 16
 	}	
 };
 
@@ -18,7 +17,7 @@ static irqreturn_t pci_driver_irq(int irq, void *data)
 	printk("IRQ:%d\n", irq);
 
 	if (drv_data->efd_ctx)
-		eventfd_signal(drv_data->efd_ctx, 1);
+		eventfd_signal(drv_data->efd_ctx);
 
 	schedule_work(&drv_data->irq_wq);
 	return result;
@@ -82,6 +81,7 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 {
 	struct pci_driver_model *dev = file->private_data;
 	int ret = 0;
+	struct dma_region *dma_usr_region;
 
 	switch (cmd) {
 		case PCI_MODEL_IOCTL_GET_BAR_INFO:
@@ -102,6 +102,45 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 			}
 			ret = 0;
 			break;
+		case PCI_MODEL_IOCTL_ALLOC_DMA:
+            dma_usr_region = kmalloc(sizeof(*dma_usr_region), GFP_KERNEL);
+            if (!dma_usr_region)
+                return -ENOMEM;
+            copy_from_user(dma_usr_region, (void * __user)arg, sizeof(*dma_usr_region));
+            dma_usr_region->dma_buffer_virt_kernel =
+                dma_alloc_coherent(&dev->pdev->dev, dma_usr_region->dma_buffer_size, &dma_usr_region->dma_buffer_phys, GFP_KERNEL);
+            if (!dma_usr_region->dma_buffer_virt_kernel) {
+                dev_err(&dev->pdev->dev, "Failed to allocate DMA buffer.");
+                kfree(dma_usr_region);
+                return -ENOMEM;
+            }
+            copy_to_user((void * __user)arg, dma_usr_region, sizeof(*dma_usr_region));
+            struct dma_region_node *new_dma_node = kmalloc(sizeof(*new_dma_node), GFP_KERNEL);
+            if (!new_dma_node) {
+                kfree(dma_usr_region);
+                return -ENOMEM;
+            }
+            new_dma_node->region = dma_usr_region;
+            list_add_tail(&new_dma_node->list, &dev->dma_regions_list);
+            ret = 0;
+            break;
+        case PCI_MODEL_IOCTL_FREE_DMA:
+            struct dma_region dma_usr_region_tmp;
+            copy_from_user(&dma_usr_region_tmp, (void * __user)arg, sizeof(dma_usr_region_tmp));
+            struct dma_region_node *node, *tmp;
+            list_for_each_entry_safe(node, tmp, &dev->dma_regions_list, list) {
+                if (node->region->dma_buffer_phys == dma_usr_region_tmp.dma_buffer_phys &&
+                    node->region->dma_buffer_size == dma_usr_region_tmp.dma_buffer_size) {
+                        dma_free_coherent(&dev->pdev->dev,
+                            node->region->dma_buffer_size,
+                            node->region->dma_buffer_virt_kernel,
+                            node->region->dma_buffer_phys);
+                        kfree(node->region);
+                        list_del(&node->list);
+                        kfree(node);
+                    }
+            }
+            ret = 0;
 		default:
 			ret = 0;
 			break;
@@ -118,26 +157,48 @@ static int pci_driver_model_char_mmap(struct file *file, struct vm_area_struct *
 	long current_size = 0;
 	struct pci_driver_model *dev = file->private_data;
 
-	pgprot_noncached(vma->vm_page_prot);
-	while (current_size < vma_size && i < 6) {
-		if (dev->bar_regs[i].size < 0x1000 ||
-			vma->vm_pgoff * PAGE_SIZE > current_offset + dev->bar_regs[i].size) {
-			goto next;
+	// mmap bar space
+	for (i = 0; i < 6; i++) {
+		if (dev->bar_regs[i].size < 0x1000) {
+			continue;
 		}
 
-		if (remap_pfn_range(vma,
-			vma->vm_start,
-			vma->vm_pgoff + dev->bar_regs[i].phys / PAGE_SIZE,
-			dev->bar_regs[i].size < vma_size ? dev->bar_regs[i].size : vma_size,
-			vma->vm_page_prot)) {
-			return -EAGAIN;
+		if (vma->vm_pgoff * PAGE_SIZE >= dev->bar_regs[i].base &&
+		vma->vm_pgoff * PAGE_SIZE + vma_size <= dev->bar_regs[i].base + dev->bar_regs[i].size) {
+			pgprot_noncached(vma->vm_page_prot);
+			if (remap_pfn_range(vma,
+				vma->vm_start,
+				vma->vm_pgoff,
+				vma_size,
+				vma->vm_page_prot)) {
+				return -EAGAIN;
+			} else {
+				return 0;
+			}
 		}
+	}
 
-		current_size += (dev->bar_regs[i].size < vma_size ? dev->bar_regs[i].size : vma_size);
-next:
-		current_offset += dev->bar_regs[i].size;
-		i++;
+	bool can_map = false;
+	struct dma_region_node *node;
+    list_for_each_entry(node, &dev->dma_regions_list, list) {
+        if (vma->vm_pgoff * PAGE_SIZE >= node->region->dma_buffer_phys &&
+            vma->vm_pgoff * PAGE_SIZE + vma_size <= node->region->dma_buffer_phys + node->region->dma_buffer_size) {
+                can_map = true;
+                break;
+            }
+    }
 
+    if (!can_map) {
+        dev_err(&dev->pdev->dev, "mmap not allowed!");
+        return -ENOMEM;
+    }
+
+	if (remap_pfn_range(vma,
+		vma->vm_start,
+		vma->vm_pgoff,
+		vma_size,
+		vma->vm_page_prot)) {
+		return -EAGAIN;
 	}
 
 	return 0;
@@ -160,14 +221,10 @@ int pci_driver_model_device_fd_create(struct pci_driver_model *pdm_dev)
 	char buffer[256] = {0};
 	struct pci_dev *pdev = pdm_dev->pdev;
 	sprintf(buffer,
-		"pci_%02x:%02x.%02x_%04x%04x",
-		pdev->bus->number,
-		(pdev->devfn >> 3) & 0x1f,
-		pdev->devfn & 0x7,
-		pdev->vendor,
-		pdev->device
+		"pci_dev_%d",
+		pdm_dev->device_idx
 	);
-	alloc_chrdev_region(&pdm_dev->dev, 0, 255, "pci_driver_model");
+	alloc_chrdev_region(&pdm_dev->dev, 0, 255, "pci_dev");
 
 	cdev_init(&pdm_dev->cdev, &pci_driver_model_char_fops);
 	pdm_dev->cdev.owner = THIS_MODULE;
@@ -219,7 +276,7 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 	ret = pci_alloc_irq_vectors(pdev, 1, drv_data->irq_count, PCI_IRQ_MSIX);
 	if (ret < 0) {
 		printk("allocate IRQs failed.\n");
-		return ret;
+		//return ret;
 	}
 	printk("allocated %d IRQ vectors.\n", ret);
 
@@ -230,22 +287,22 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 
 	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
 
-	drv_data->dma_buffer_size = 0x1000;
-	drv_data->dma_buffer_virt = dma_alloc_coherent(&drv_data->pdev->dev, drv_data->dma_buffer_size, &drv_data->dma_buffer, GFP_KERNEL);
-
 	pci_driver_model_device_fd_create(drv_data);
 
 	for (i = 0; i < 6; i++) {
 		bar_base = pci_resource_start(pdev, i);
 		bar_len = pci_resource_len(pdev, i);
 		printk("BAR%d:base = 0x%08llx, len = 0x%llx\n", i, bar_base, bar_len);
-		drv_data->bar_regs[i].phys = bar_base;
+		drv_data->bar_regs[i].base = bar_base;
 		drv_data->bar_regs[i].size = bar_len;
 		if (bar_len != 0)
-			drv_data->bar_regs[i].virt = ioremap(bar_base, bar_len);
+			drv_data->bar_regs[i].virt_kernel = ioremap(bar_base, bar_len);
 	}
 
+	drv_data->device_idx = device_cnt++;
+
 	//pci_driver_model_mdev_init(&drv_data->pdev->dev, NULL);
+	INIT_LIST_HEAD(&drv_data->dma_regions_list);
 
 	return 0;
 }
@@ -258,7 +315,16 @@ static void pci_driver_model_remove(struct pci_dev *pdev)
 		free_irq(pci_irq_vector(pdev, i), pci_get_drvdata(pdev));
 	}
 	pci_driver_model_device_fd_destory(drv_data);
-	dma_free_coherent(&drv_data->pdev->dev, drv_data->dma_buffer_size, drv_data->dma_buffer_virt, drv_data->dma_buffer);
+	struct dma_region_node *node, *tmp;
+	list_for_each_entry_safe(node, tmp, &drv_data->dma_regions_list, list) {
+		dma_free_coherent(&pdev->dev,
+			node->region->dma_buffer_size,
+			node->region->dma_buffer_virt_kernel,
+			node->region->dma_buffer_phys);
+		kfree(node->region);
+		list_del(&node->list);
+		kfree(node);
+	}
 	kfree(drv_data);
 }
 
