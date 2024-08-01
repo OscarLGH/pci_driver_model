@@ -17,7 +17,7 @@ static irqreturn_t pci_driver_irq(int irq, void *data)
 	printk("IRQ:%d\n", irq);
 
 	if (drv_data->efd_ctx)
-		eventfd_signal(drv_data->efd_ctx);
+		eventfd_signal(drv_data->efd_ctx, 1);
 
 	schedule_work(&drv_data->irq_wq);
 	return result;
@@ -338,7 +338,7 @@ pci_driver_model_driver = {
 
 static int __init pci_driver_init(void)
 {
-	pci_driver_model_class = class_create("pci_driver_model");
+	pci_driver_model_class = class_create(THIS_MODULE, "pci_driver_model");
 	return pci_register_driver(&pci_driver_model_driver);
 }
 
