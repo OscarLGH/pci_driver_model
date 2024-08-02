@@ -287,6 +287,7 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 
 	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
 
+	drv_data->device_idx = device_cnt++;
 	pci_driver_model_device_fd_create(drv_data);
 
 	for (i = 0; i < 6; i++) {
@@ -298,8 +299,6 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 		if (bar_len != 0)
 			drv_data->bar_regs[i].virt_kernel = ioremap(bar_base, bar_len);
 	}
-
-	drv_data->device_idx = device_cnt++;
 
 	//pci_driver_model_mdev_init(&drv_data->pdev->dev, NULL);
 	INIT_LIST_HEAD(&drv_data->dma_regions_list);
