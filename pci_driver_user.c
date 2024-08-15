@@ -190,6 +190,8 @@ int main()
     uint64_t *dma_region_ptr;
     uint64_t cmd[0x100] = {0};
 
+    pci_device *devs[MAX_PCI_DEV];
+
     cnt = enum_devices();
 
     printf("device num:%d\n", cnt);
@@ -200,6 +202,7 @@ int main()
         if (dev_ptr == NULL) {
             printf("open device error!\n");
             return -1;
+            devs[dev_idx] = dev_ptr;
         }
 
         //allocate 8 4K dma buffers.
@@ -223,17 +226,33 @@ int main()
         dma_region_ptr[2] = 0x12345678;
         dma_region_ptr[3] = 0x87654321;
 
+        // bar2 write test for noc space.
+        char * remote_serial_test_string = "This string is from qemu pcie driver.\n";
+        for (i = 0; i < strlen(remote_serial_test_string); i++) {
+            dev_ptr->bar_regs[2].virt_user[0x10000000 / 4] = remote_serial_test_string[i];
+        }
 
-        cmd[0] = 0x0;
-        cmd[1] = 0x1;
-        cmd[2] = 0x2;
-        cmd[3] = 0x3;
+        //dma test: dma from noc space.
+        uint64_t noc_addr = 0x80000000;
+        uint64_t dst_addr = dma_regions[0]->dma_buffer_phys;
+        uint64_t length = 0x1000;
+        dev_ptr->bar_regs[0].virt_user[0x30 / 4] = noc_addr;
+        dev_ptr->bar_regs[0].virt_user[0x34 / 4] = (noc_addr >> 32);
+        dev_ptr->bar_regs[0].virt_user[0x38 / 4] = dst_addr;
+        dev_ptr->bar_regs[0].virt_user[0x3c / 4] = (dst_addr >> 32);
+        dev_ptr->bar_regs[0].virt_user[0x40 / 4] = length;
+        dev_ptr->bar_regs[0].virt_user[0x44 / 4] = (length >> 32);
+        dev_ptr->bar_regs[0].virt_user[0x48 / 4] = 2; //DMA from device
+        dev_ptr->bar_regs[0].virt_user[0x50 / 4] = 0;
 
-        dev_ptr->bar_regs[0].virt_user[0] = 0x12345678;
-        printf("reg0:0x%llx\n", dev_ptr->bar_regs[0].virt_user[0]);
+        printf("DMA from noc:\n");
+        char *ptr = &dma_regions[0]->dma_buffer_virt_user[0];
+        for (i = 0; i < 16; i++) {
+            printf("%02x ", ptr[i]);
+        }
 
         printf("waiting for command to finish...\n");
-        wait_command_finish(dev_ptr);
+        //wait_command_finish(dev_ptr);
         printf("command finished.\n");
 
         // free dma buffers.
