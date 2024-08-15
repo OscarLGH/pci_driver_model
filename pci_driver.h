@@ -10,6 +10,7 @@
 #include <linux/errno.h>
 #include <linux/cdev.h>
 #include <linux/proc_fs.h>
+#include <linux/version.h>
 #include <asm/cacheflush.h>
 
 #include <linux/dma-mapping.h>

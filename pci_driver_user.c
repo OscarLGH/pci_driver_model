@@ -20,8 +20,8 @@
 struct pci_bar_reg {
 	uint64_t base;
 	size_t size;
-	uint32_t *virt_kernel; //not used, do not touch.
-	uint32_t *virt_user;
+	uint64_t *virt_kernel; //not used, do not touch.
+	uint64_t *virt_user;
 };
 
 typedef struct pci_device {
@@ -202,8 +202,9 @@ int main()
         if (dev_ptr == NULL) {
             printf("open device error!\n");
             return -1;
-            devs[dev_idx] = dev_ptr;
         }
+
+        devs[dev_idx] = dev_ptr;
 
         //allocate 8 4K dma buffers.
         for (i = 0; i < 8; i++) {
@@ -226,31 +227,56 @@ int main()
         dma_region_ptr[2] = 0x12345678;
         dma_region_ptr[3] = 0x87654321;
 
+        printf("bar2 write.\n");
         // bar2 write test for noc space.
         char * remote_serial_test_string = "This string is from qemu pcie driver.\n";
         for (i = 0; i < strlen(remote_serial_test_string); i++) {
             dev_ptr->bar_regs[2].virt_user[0x10000000 / 4] = remote_serial_test_string[i];
         }
 
-        //dma test: dma from noc space.
-        uint64_t noc_addr = 0x80000000;
-        uint64_t dst_addr = dma_regions[0]->dma_buffer_phys;
+        printf("dma to device.\n");
+        //dma test: dma to device.
+        uint64_t src_addr = dma_regions[0]->dma_buffer_phys;
+        uint64_t dst_addr = 0;
         uint64_t length = 0x1000;
-        dev_ptr->bar_regs[0].virt_user[0x30 / 4] = noc_addr;
-        dev_ptr->bar_regs[0].virt_user[0x34 / 4] = (noc_addr >> 32);
-        dev_ptr->bar_regs[0].virt_user[0x38 / 4] = dst_addr;
-        dev_ptr->bar_regs[0].virt_user[0x3c / 4] = (dst_addr >> 32);
-        dev_ptr->bar_regs[0].virt_user[0x40 / 4] = length;
-        dev_ptr->bar_regs[0].virt_user[0x44 / 4] = (length >> 32);
-        dev_ptr->bar_regs[0].virt_user[0x48 / 4] = 2; //DMA from device
-        dev_ptr->bar_regs[0].virt_user[0x50 / 4] = 0;
+        dev_ptr->bar_regs[0].virt_user[0x30 / 8] = src_addr;
+        dev_ptr->bar_regs[0].virt_user[0x38 / 8] = dst_addr;
+        dev_ptr->bar_regs[0].virt_user[0x40 / 8] = length;
+        dev_ptr->bar_regs[0].virt_user[0x48 / 8] = 1; //DMA to device
+        dev_ptr->bar_regs[0].virt_user[0x50 / 8] = 0;
 
-        printf("DMA from noc:\n");
-        char *ptr = &dma_regions[0]->dma_buffer_virt_user[0];
-        for (i = 0; i < 16; i++) {
-            printf("%02x ", ptr[i]);
+        //dma test: dma from noc space.
+        src_addr = 0x80000000;
+        dst_addr = dma_regions[0]->dma_buffer_phys;
+        length = 0x1000;
+        //dev_ptr->bar_regs[0].virt_user[0x30 / 8] = src_addr;
+        //dev_ptr->bar_regs[0].virt_user[0x38 / 8] = dst_addr;
+        //dev_ptr->bar_regs[0].virt_user[0x40 / 8] = length;
+        //dev_ptr->bar_regs[0].virt_user[0x48 / 8] = 2; //DMA from device
+        //dev_ptr->bar_regs[0].virt_user[0x50 / 8] = 0;
+
+        //printf("DMA from noc:\n");
+        //char *ptr = &dma_regions[0]->dma_buffer_virt_user[0];
+        //for (i = 0; i < 16; i++) {
+        //    printf("%02x ", ptr[i]);
+        //}
+
+        printf("p2p.\n");
+        // PCIE P2P test.
+        if (dev_ptr->index == 1) {
+            src_addr = 0;
+            dst_addr = devs[0]->bar_regs[2].base;
+            length = 0x1000;
+            dev_ptr->bar_regs[0].virt_user[0x30 / 8] = src_addr;
+            dev_ptr->bar_regs[0].virt_user[0x38 / 8] = dst_addr;
+            dev_ptr->bar_regs[0].virt_user[0x40 / 8] = length;
+            dev_ptr->bar_regs[0].virt_user[0x48 / 8] = 2; //DMA from device
+            dev_ptr->bar_regs[0].virt_user[0x50 / 8] = 0;
         }
 
+        sleep(1);
+        printf("P2P test: dev0 bar2[0] = %llx\n", devs[0]->bar_regs[2].virt_user[0]);
+        
         printf("waiting for command to finish...\n");
         //wait_command_finish(dev_ptr);
         printf("command finished.\n");
@@ -264,7 +290,7 @@ int main()
             }
         }
 
-        close_pci_device(dev_ptr);
+        //close_pci_device(dev_ptr);
 
     }
     return 0;
