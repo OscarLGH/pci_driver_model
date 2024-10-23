@@ -277,8 +277,9 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 
 	pci_set_master(pdev);
 
-	drv_data->irq_count = 1;
-	ret = pci_alloc_irq_vectors(pdev, 1, drv_data->irq_count, PCI_IRQ_MSIX);
+	printk("MSI:request %d vectors.\n", pci_msi_vec_count(drv_data->pdev));
+	drv_data->irq_count = pci_msi_vec_count(drv_data->pdev);
+	ret = pci_alloc_irq_vectors(pdev, 1, drv_data->irq_count, PCI_IRQ_MSI);
 	if (ret < 0) {
 		printk("allocate IRQs failed.\n");
 		//return ret;
