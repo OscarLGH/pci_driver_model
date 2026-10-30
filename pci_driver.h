@@ -65,6 +65,21 @@ struct dma_region_node {
 	struct list_head list;
 };
 
+/*
+ * A BAR exported as a dma-buf (PCI_MODEL_IOCTL_EXPORT_BAR), for peer-to-peer
+ * DMA. The backing struct pages come from pci_p2pdma_add_resource(); one
+ * buffer per BAR is cached, each further ioctl on the same BAR only adds an
+ * fd (another dma-buf reference) for it.
+ */
+struct pci_bar_dmabuf {
+	struct pci_driver_model *drv;
+	int bar_nr;
+	struct page *page;	/* first struct page of the p2pdma provider */
+	size_t len;
+	struct dma_buf *dmabuf;
+	int attached;		/* live importers, guarded by ops_lock */
+};
+
 struct pci_driver_model {
 	struct pci_dev *pdev;
 	struct pci_bar_reg bar_regs[6];
@@ -98,6 +113,13 @@ struct pci_driver_model {
 	/* DMA buffer list.*/
 	struct list_head dma_regions_list;
 
+	/* dma-buf exports of BARs for peer-to-peer DMA, indexed by BAR number
+	 * (see PCI_MODEL_IOCTL_EXPORT_BAR). bar_p2p_added[i] records that the
+	 * p2pdma provider for BAR i is registered; it is devm-managed and
+	 * stays registered until this driver unbinds from the device. */
+	struct pci_bar_dmabuf *bar_dmabufs[6];
+	bool bar_p2p_added[6];
+
 	/* drv_data outlives remove() while user-space fds are still open. */
 	struct kref kref;
 };
@@ -109,6 +131,18 @@ struct pci_driver_model {
 #define PCI_MODEL_IOCTL_SET_IRQ			_IOW(PCI_MODEL_IOCTL_MAGIC, 3, void *)
 #define PCI_MODEL_IOCTL_ALLOC_DMA		_IOW(PCI_MODEL_IOCTL_MAGIC, 4, void *)
 #define PCI_MODEL_IOCTL_FREE_DMA		_IOW(PCI_MODEL_IOCTL_MAGIC, 5, void *)
+/*
+ * Export a BAR as a dma-buf for peer-to-peer DMA. Like SET_IRQFD, the ioctl
+ * argument is the value itself (the BAR number), not a pointer; the return
+ * value is the dma-buf fd. The BAR must be a memory BAR that is at least
+ * 2 MiB and 2 MiB aligned: pci_p2pdma_add_resource() needs its struct-page
+ * range to align to the x86 memory-section size. An importing driver gets
+ * the BAR's bus address through dma_map_sgtable() only when the kernel
+ * p2pdma policy accepts the provider/client pair (both devices behind one
+ * upstream PCIe bridge -> map type PCI_P2PDMA_MAP_BUS_ADDR), otherwise the
+ * import's map fails with -EREMOTEIO.
+ */
+#define PCI_MODEL_IOCTL_EXPORT_BAR	_IOR(PCI_MODEL_IOCTL_MAGIC, 6, void *)
 
 /*
  * vfio-mdev interfaces (virt.c, built as pci_driver_virt.ko).

@@ -1,5 +1,12 @@
 #include "pci_driver.h"
 
+#include <linux/dma-buf.h>
+#include <linux/pci-p2pdma.h>
+#include <linux/mm.h>
+#include <linux/pfn.h>
+#include <linux/scatterlist.h>
+#include <linux/sizes.h>
+
 /* the INTx flag was called PCI_IRQ_LEGACY before the rename in v6.x */
 #ifndef PCI_IRQ_INTX
 #define PCI_IRQ_INTX PCI_IRQ_LEGACY
@@ -170,6 +177,8 @@ static ssize_t pci_driver_model_char_write(struct file *file, const char __user 
 	return -EOPNOTSUPP;
 }
 
+static int pci_driver_model_export_bar(struct pci_driver_model *drv, int bar_nr);
+
 static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pci_driver_model *dev = file->private_data;
@@ -179,7 +188,7 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 	struct dma_region dma_usr_region;
 	struct eventfd_ctx *ctx;
 	unsigned long size;
-	int i, ret = 0;
+	int i, ret = 0, bar_nr;
 
 	switch (cmd) {
 		case PCI_MODEL_IOCTL_GET_BAR_INFO:
@@ -285,6 +294,20 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 			}
 			mutex_unlock(&dev->ops_lock);
 			break;
+		case PCI_MODEL_IOCTL_EXPORT_BAR:
+			/* like SET_IRQFD the argument is the value (BAR number) */
+			bar_nr = (int)(unsigned long)arg;
+			if (bar_nr < 0 || bar_nr >= 6)
+				return -EINVAL;
+			mutex_lock(&dev->ops_lock);
+			if (dev->removed) {
+				ret = -ENODEV;
+			} else {
+				ret = pci_driver_model_export_bar(dev, bar_nr);
+			}
+			mutex_unlock(&dev->ops_lock);
+			/* ret is a dma-buf fd (>= 0) or a negative errno */
+			return ret;
 		default:
 			ret = -EINVAL;
 			break;
@@ -375,6 +398,190 @@ static int pci_driver_model_char_mmap(struct file *file, struct vm_area_struct *
 	mutex_unlock(&dev->ops_lock);
 
 	return ret;
+}
+
+/*
+ * dma-buf export of a device BAR, so another device's driver (an RDMA driver,
+ * for instance) can import the BAR and DMA into it directly (peer-to-peer).
+ *
+ * The kernel's own p2pdma provider backs the buffer:
+ *  - pci_p2pdma_add_resource() creates the struct pages for the BAR range;
+ *    that range must align to the memory-section size, hence the 2 MiB
+ *    alignment/size check in the ioctl.
+ *  - map_dma_buf must hand the importer an sgt already mapped into the
+ *    importer's DMA address space. dma_map_sgtable() on these p2pdma pages
+ *    runs the provider/client policy check: a common upstream PCIe bridge
+ *    classifies the mapping as PCI_P2PDMA_MAP_BUS_ADDR and fills in the
+ *    BAR's bus address; without one the check fails with -EREMOTEIO.
+ */
+static int pci_bar_dmabuf_attach(struct dma_buf *dmabuf,
+				 struct dma_buf_attachment *att)
+{
+	struct pci_bar_dmabuf *b = dmabuf->priv;
+
+	mutex_lock(&b->drv->ops_lock);
+	b->attached++;
+	mutex_unlock(&b->drv->ops_lock);
+	dev_info(&b->drv->pdev->dev, "BAR%d dma-buf attach from %s\n",
+		 b->bar_nr, dev_name(att->dev));
+	return 0;
+}
+
+static void pci_bar_dmabuf_detach(struct dma_buf *dmabuf,
+				  struct dma_buf_attachment *att)
+{
+	struct pci_bar_dmabuf *b = dmabuf->priv;
+
+	mutex_lock(&b->drv->ops_lock);
+	b->attached--;
+	mutex_unlock(&b->drv->ops_lock);
+	dev_info(&b->drv->pdev->dev, "BAR%d dma-buf detach from %s\n",
+		 b->bar_nr, dev_name(att->dev));
+}
+
+static struct sg_table *pci_bar_dmabuf_map(struct dma_buf_attachment *att,
+					   enum dma_data_direction dir)
+{
+	struct pci_bar_dmabuf *b = att->dmabuf->priv;
+	struct sg_table *sgt;
+	int ret;
+
+	sgt = kmalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+	if (sg_alloc_table(sgt, 1, GFP_KERNEL)) {
+		kfree(sgt);
+		return ERR_PTR(-ENOMEM);
+	}
+	sg_set_page(sgt->sgl, b->page, b->len, 0);
+
+	ret = dma_map_sgtable(att->dev, sgt, dir, 0);
+	if (ret) {
+		dev_info(&b->drv->pdev->dev,
+			"BAR%d dma_map_sgtable for %s failed: %d\n",
+			b->bar_nr, dev_name(att->dev), ret);
+		sg_free_table(sgt);
+		kfree(sgt);
+		return ERR_PTR(ret);
+	}
+
+	dev_info(&b->drv->pdev->dev,
+		"BAR%d mapped for %s dir=%d dma=0x%llx size=%zu\n",
+		b->bar_nr, dev_name(att->dev), dir,
+		(unsigned long long)sg_dma_address(sgt->sgl), b->len);
+	return sgt;
+}
+
+static void pci_bar_dmabuf_unmap(struct dma_buf_attachment *att,
+				 struct sg_table *sgt,
+				 enum dma_data_direction dir)
+{
+	dma_unmap_sgtable(att->dev, sgt, dir, 0);
+	sg_free_table(sgt);
+	kfree(sgt);
+}
+
+static void pci_bar_dmabuf_release(struct dma_buf *dmabuf)
+{
+	struct pci_bar_dmabuf *b = dmabuf->priv;
+	struct pci_driver_model *drv = b->drv;
+
+	mutex_lock(&drv->ops_lock);
+	if (drv->bar_dmabufs[b->bar_nr] == b)
+		drv->bar_dmabufs[b->bar_nr] = NULL;
+	mutex_unlock(&drv->ops_lock);
+	dev_info(&drv->pdev->dev, "BAR%d dma-buf released\n", b->bar_nr);
+	kfree(b);
+}
+
+static const struct dma_buf_ops pci_bar_dmabuf_ops = {
+	.attach = pci_bar_dmabuf_attach,
+	.detach = pci_bar_dmabuf_detach,
+	.map_dma_buf = pci_bar_dmabuf_map,
+	.unmap_dma_buf = pci_bar_dmabuf_unmap,
+	.release = pci_bar_dmabuf_release,
+};
+
+/*
+ * Hand out a dma-buf fd for one BAR (caller holds ops_lock). The buffer is
+ * cached per BAR: repeat calls only add a reference and a new fd. The
+ * p2pdma provider is registered on first use and lives until the driver
+ * unbinds (devm), even if every exported buffer is closed meanwhile.
+ */
+static int pci_driver_model_export_bar(struct pci_driver_model *drv, int bar_nr)
+{
+	struct pci_dev *pdev = drv->pdev;
+	DEFINE_DMA_BUF_EXPORT_INFO(info);
+	struct pci_bar_dmabuf *b;
+	struct dma_buf *dmabuf;
+	resource_size_t start = pci_resource_start(pdev, bar_nr);
+	size_t len = pci_resource_len(pdev, bar_nr);
+	int fd;
+
+	if (!(pci_resource_flags(pdev, bar_nr) & IORESOURCE_MEM)) {
+		dev_err(&pdev->dev, "BAR%d is not a memory BAR\n", bar_nr);
+		return -EINVAL;
+	}
+	if (!IS_ALIGNED(start, SZ_2M) || len < SZ_2M) {
+		dev_err(&pdev->dev,
+			"BAR%d base %pa size 0x%zx: dma-buf export needs a 2 MiB aligned BAR of at least 2 MiB\n",
+			bar_nr, &start, len);
+		return -EINVAL;
+	}
+
+	b = drv->bar_dmabufs[bar_nr];
+	if (b) {
+		/* dma_buf_fd() consumes one reference per fd; the export
+		 * reference was already handed to the first fd */
+		get_dma_buf(b->dmabuf);
+	} else {
+		b = kzalloc(sizeof(*b), GFP_KERNEL);
+		if (!b)
+			return -ENOMEM;
+		b->drv = drv;
+		b->bar_nr = bar_nr;
+		b->len = len;
+
+		if (!drv->bar_p2p_added[bar_nr]) {
+			int ret = pci_p2pdma_add_resource(pdev, bar_nr, 0, 0);
+
+			if (ret) {
+				dev_err(&pdev->dev,
+					"pci_p2pdma_add_resource(BAR%d) failed: %d\n",
+					bar_nr, ret);
+				kfree(b);
+				return ret;
+			}
+			drv->bar_p2p_added[bar_nr] = true;
+		}
+		b->page = pfn_to_page(PHYS_PFN(start));
+
+		info.ops = &pci_bar_dmabuf_ops;
+		info.size = len;
+		info.priv = b;
+		/* DEFINE_DMA_BUF_EXPORT_INFO sets owner = THIS_MODULE: the
+		 * dma-buf core holds a module reference until the buffer's
+		 * release() runs, so rmmod is refused while an exported
+		 * buffer (or an MR using it) is alive */
+		dmabuf = dma_buf_export(&info);
+		if (IS_ERR(dmabuf)) {
+			int ret = PTR_ERR(dmabuf);
+
+			kfree(b);
+			return ret;
+		}
+		b->dmabuf = dmabuf;
+		drv->bar_dmabufs[bar_nr] = b;
+	}
+
+	fd = dma_buf_fd(b->dmabuf, O_CLOEXEC);
+	if (fd < 0) {
+		/* drop the reference reserved for this fd */
+		dma_buf_put(b->dmabuf);
+		return fd;
+	}
+	dev_info(&pdev->dev, "BAR%d exported as dma-buf, fd=%d\n", bar_nr, fd);
+	return fd;
 }
 
 static const struct file_operations pci_driver_model_char_fops = {
@@ -618,6 +825,15 @@ static void pci_driver_model_remove(struct pci_dev *pdev)
 		list_del(&node->list);
 		kfree(node);
 	}
+	/* An exported buffer pins the module, so rmmod is refused while one is
+	 * alive; reaching here with a live buffer means a manual sysfs unbind.
+	 * The devm p2pdma provider (its struct pages) goes away when this
+	 * returns, leaving any surviving importer with stale pages. */
+	for (i = 0; i < 6; i++)
+		if (drv_data->bar_dmabufs[i])
+			dev_warn(&pdev->dev,
+				"BAR%d dma-buf still exported; its p2pdma pages go away with this unbind\n",
+				i);
 	mutex_unlock(&drv_data->ops_lock);
 
 	/* the bottom half touches drv_data, so it must be gone before we drop
@@ -675,6 +891,8 @@ static void __exit pci_driver_exit(void)
 
 module_init(pci_driver_init);
 module_exit(pci_driver_exit);
-MODULE_DESCRIPTION("Generic PCI device test harness: BAR mmap, eventfd IRQs and coherent DMA buffers");
+MODULE_DESCRIPTION("Generic PCI device test harness: BAR mmap, eventfd IRQs, coherent DMA buffers and BAR dma-buf export (p2pdma)");
 MODULE_AUTHOR("OscarLGH");
 MODULE_LICENSE("GPL");
+/* dma_buf_export/dma_buf_fd/get/put are exported in the DMA_BUF namespace */
+MODULE_IMPORT_NS("DMA_BUF");
