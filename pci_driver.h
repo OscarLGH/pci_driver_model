@@ -66,18 +66,36 @@ struct dma_region_node {
 };
 
 /*
- * A BAR exported as a dma-buf (PCI_MODEL_IOCTL_EXPORT_BAR), for peer-to-peer
- * DMA. The backing struct pages come from pci_p2pdma_add_resource(); one
- * buffer per BAR is cached, each further ioctl on the same BAR only adds an
- * fd (another dma-buf reference) for it.
+ * A BAR (sub-)range exported as a dma-buf (PCI_MODEL_IOCTL_EXPORT_BAR), for
+ * peer-to-peer DMA. The backing struct pages come from
+ * pci_p2pdma_add_resource(); one buffer per (bar, offset, size) is cached,
+ * each further ioctl on the same range only adds an fd (another dma-buf
+ * reference) for it.
  */
 struct pci_bar_dmabuf {
 	struct pci_driver_model *drv;
+	struct list_head list;
 	int bar_nr;
-	struct page *page;	/* first struct page of the p2pdma provider */
+	u64 offset;		/* range start inside the BAR */
+	struct page *page;	/* first struct page of the range (p2pdma) */
 	size_t len;
 	struct dma_buf *dmabuf;
 	int attached;		/* live importers, guarded by ops_lock */
+};
+
+/*
+ * A BAR (sub-)range registered as a p2pdma provider by
+ * pci_p2pdma_add_resource(). The registration is devm-managed and lives
+ * until this driver unbinds, even if every exported buffer goes away first.
+ * The list is bookkeeping: it lets a range contained in an already
+ * registered one reuse its struct pages, and rejects overlapping
+ * registrations, which would collide with the populated struct pages.
+ */
+struct pci_p2p_range {
+	struct list_head list;
+	int bar;
+	u64 offset;
+	u64 size;
 };
 
 struct pci_driver_model {
@@ -113,12 +131,13 @@ struct pci_driver_model {
 	/* DMA buffer list.*/
 	struct list_head dma_regions_list;
 
-	/* dma-buf exports of BARs for peer-to-peer DMA, indexed by BAR number
-	 * (see PCI_MODEL_IOCTL_EXPORT_BAR). bar_p2p_added[i] records that the
-	 * p2pdma provider for BAR i is registered; it is devm-managed and
-	 * stays registered until this driver unbinds from the device. */
-	struct pci_bar_dmabuf *bar_dmabufs[6];
-	bool bar_p2p_added[6];
+	/* dma-buf exports of BAR (sub-)ranges for peer-to-peer DMA (see
+	 * PCI_MODEL_IOCTL_EXPORT_BAR). bar_dmabufs caches one buffer per
+	 * (bar, offset, size); p2p_ranges records the ranges registered as
+	 * p2pdma providers (devm-managed, they live until this driver
+	 * unbinds from the device). */
+	struct list_head bar_dmabufs;
+	struct list_head p2p_ranges;
 
 	/* drv_data outlives remove() while user-space fds are still open. */
 	struct kref kref;
@@ -132,17 +151,34 @@ struct pci_driver_model {
 #define PCI_MODEL_IOCTL_ALLOC_DMA		_IOW(PCI_MODEL_IOCTL_MAGIC, 4, void *)
 #define PCI_MODEL_IOCTL_FREE_DMA		_IOW(PCI_MODEL_IOCTL_MAGIC, 5, void *)
 /*
- * Export a BAR as a dma-buf for peer-to-peer DMA. Like SET_IRQFD, the ioctl
- * argument is the value itself (the BAR number), not a pointer; the return
- * value is the dma-buf fd. The BAR must be a memory BAR that is at least
- * 2 MiB and 2 MiB aligned: pci_p2pdma_add_resource() needs its struct-page
- * range to align to the x86 memory-section size. An importing driver gets
+ * Argument of PCI_MODEL_IOCTL_EXPORT_BAR: selects which (sub-)range of which
+ * BAR to export. offset is into the BAR, size is the range length; size == 0
+ * means "to the end of the BAR". Both ends of the range must be multiples of
+ * 2 MiB so that pci_p2pdma_add_resource() can create its struct pages on
+ * x86 memory-section boundaries. A range that lies inside an already
+ * registered one reuses it; a range that overlaps one without being inside
+ * it is rejected with -EBUSY. Only the registered range gets struct pages
+ * (~64 B of struct page per 4 KiB), so exporting just the peer-DMA part of a
+ * very large BAR keeps that overhead small and leaves the rest of the BAR to
+ * plain MMIO access.
+ */
+struct pci_model_export_req {
+	u32 bar;
+	u32 flags;	/* must be 0 */
+	u64 offset;
+	u64 size;	/* 0 = to the end of the BAR */
+};
+
+/*
+ * Export a BAR (sub-)range as a dma-buf for peer-to-peer DMA. The ioctl
+ * argument is a pointer to struct pci_model_export_req; the return value is
+ * the dma-buf fd. The BAR must be a memory BAR. An importing driver gets
  * the BAR's bus address through dma_map_sgtable() only when the kernel
  * p2pdma policy accepts the provider/client pair (both devices behind one
  * upstream PCIe bridge -> map type PCI_P2PDMA_MAP_BUS_ADDR), otherwise the
  * import's map fails with -EREMOTEIO.
  */
-#define PCI_MODEL_IOCTL_EXPORT_BAR	_IOR(PCI_MODEL_IOCTL_MAGIC, 6, void *)
+#define PCI_MODEL_IOCTL_EXPORT_BAR	_IOWR(PCI_MODEL_IOCTL_MAGIC, 6, void *)
 
 /*
  * vfio-mdev interfaces (virt.c, built as pci_driver_virt.ko).

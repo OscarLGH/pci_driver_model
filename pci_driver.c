@@ -177,7 +177,8 @@ static ssize_t pci_driver_model_char_write(struct file *file, const char __user 
 	return -EOPNOTSUPP;
 }
 
-static int pci_driver_model_export_bar(struct pci_driver_model *drv, int bar_nr);
+static int pci_driver_model_export_bar(struct pci_driver_model *drv,
+				       const struct pci_model_export_req *req);
 
 static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -186,9 +187,10 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 	struct dma_region_node *node, *tmp;
 	struct pci_bar_reg bar_regs[6];
 	struct dma_region dma_usr_region;
+	struct pci_model_export_req req;
 	struct eventfd_ctx *ctx;
 	unsigned long size;
-	int i, ret = 0, bar_nr;
+	int i, ret = 0;
 
 	switch (cmd) {
 		case PCI_MODEL_IOCTL_GET_BAR_INFO:
@@ -295,15 +297,16 @@ static long pci_driver_model_char_ioctl(struct file *file, unsigned int cmd, uns
 			mutex_unlock(&dev->ops_lock);
 			break;
 		case PCI_MODEL_IOCTL_EXPORT_BAR:
-			/* like SET_IRQFD the argument is the value (BAR number) */
-			bar_nr = (int)(unsigned long)arg;
-			if (bar_nr < 0 || bar_nr >= 6)
+			/* the argument is a struct pci_model_export_req */
+			if (copy_from_user(&req, uarg, sizeof(req)))
+				return -EFAULT;
+			if (req.bar >= 6)
 				return -EINVAL;
 			mutex_lock(&dev->ops_lock);
 			if (dev->removed) {
 				ret = -ENODEV;
 			} else {
-				ret = pci_driver_model_export_bar(dev, bar_nr);
+				ret = pci_driver_model_export_bar(dev, &req);
 			}
 			mutex_unlock(&dev->ops_lock);
 			/* ret is a dma-buf fd (>= 0) or a negative errno */
@@ -407,7 +410,9 @@ static int pci_driver_model_char_mmap(struct file *file, struct vm_area_struct *
  * The kernel's own p2pdma provider backs the buffer:
  *  - pci_p2pdma_add_resource() creates the struct pages for the BAR range;
  *    that range must align to the memory-section size, hence the 2 MiB
- *    alignment/size check in the ioctl.
+ *    alignment checks on the ioctl's (offset, size). Only the registered
+ *    range gets struct pages, so a large BAR whose peer-DMA part is small
+ *    does not pay the ~64 B-per-4-KiB page-array cost for the whole BAR.
  *  - map_dma_buf must hand the importer an sgt already mapped into the
  *    importer's DMA address space. dma_map_sgtable() on these p2pdma pages
  *    runs the provider/client policy check: a common upstream PCIe bridge
@@ -422,8 +427,8 @@ static int pci_bar_dmabuf_attach(struct dma_buf *dmabuf,
 	mutex_lock(&b->drv->ops_lock);
 	b->attached++;
 	mutex_unlock(&b->drv->ops_lock);
-	dev_info(&b->drv->pdev->dev, "BAR%d dma-buf attach from %s\n",
-		 b->bar_nr, dev_name(att->dev));
+	dev_info(&b->drv->pdev->dev, "BAR%d+0x%llx dma-buf attach from %s\n",
+		 b->bar_nr, (unsigned long long)b->offset, dev_name(att->dev));
 	return 0;
 }
 
@@ -435,8 +440,8 @@ static void pci_bar_dmabuf_detach(struct dma_buf *dmabuf,
 	mutex_lock(&b->drv->ops_lock);
 	b->attached--;
 	mutex_unlock(&b->drv->ops_lock);
-	dev_info(&b->drv->pdev->dev, "BAR%d dma-buf detach from %s\n",
-		 b->bar_nr, dev_name(att->dev));
+	dev_info(&b->drv->pdev->dev, "BAR%d+0x%llx dma-buf detach from %s\n",
+		 b->bar_nr, (unsigned long long)b->offset, dev_name(att->dev));
 }
 
 static struct sg_table *pci_bar_dmabuf_map(struct dma_buf_attachment *att,
@@ -458,16 +463,18 @@ static struct sg_table *pci_bar_dmabuf_map(struct dma_buf_attachment *att,
 	ret = dma_map_sgtable(att->dev, sgt, dir, 0);
 	if (ret) {
 		dev_info(&b->drv->pdev->dev,
-			"BAR%d dma_map_sgtable for %s failed: %d\n",
-			b->bar_nr, dev_name(att->dev), ret);
+			"BAR%d+0x%llx dma_map_sgtable for %s failed: %d\n",
+			b->bar_nr, (unsigned long long)b->offset,
+			dev_name(att->dev), ret);
 		sg_free_table(sgt);
 		kfree(sgt);
 		return ERR_PTR(ret);
 	}
 
 	dev_info(&b->drv->pdev->dev,
-		"BAR%d mapped for %s dir=%d dma=0x%llx size=%zu\n",
-		b->bar_nr, dev_name(att->dev), dir,
+		"BAR%d+0x%llx mapped for %s dir=%d dma=0x%llx size=%zu\n",
+		b->bar_nr, (unsigned long long)b->offset,
+		dev_name(att->dev), dir,
 		(unsigned long long)sg_dma_address(sgt->sgl), b->len);
 	return sgt;
 }
@@ -487,10 +494,10 @@ static void pci_bar_dmabuf_release(struct dma_buf *dmabuf)
 	struct pci_driver_model *drv = b->drv;
 
 	mutex_lock(&drv->ops_lock);
-	if (drv->bar_dmabufs[b->bar_nr] == b)
-		drv->bar_dmabufs[b->bar_nr] = NULL;
+	list_del(&b->list);
 	mutex_unlock(&drv->ops_lock);
-	dev_info(&drv->pdev->dev, "BAR%d dma-buf released\n", b->bar_nr);
+	dev_info(&drv->pdev->dev, "BAR%d+0x%llx dma-buf released\n",
+		 b->bar_nr, (unsigned long long)b->offset);
 	kfree(b);
 }
 
@@ -503,84 +510,146 @@ static const struct dma_buf_ops pci_bar_dmabuf_ops = {
 };
 
 /*
- * Hand out a dma-buf fd for one BAR (caller holds ops_lock). The buffer is
- * cached per BAR: repeat calls only add a reference and a new fd. The
- * p2pdma provider is registered on first use and lives until the driver
- * unbinds (devm), even if every exported buffer is closed meanwhile.
+ * Hand out a dma-buf fd for one (BAR, offset, size) range (caller holds
+ * ops_lock). The buffer is cached per range: repeat calls only add a
+ * reference and a new fd. A p2pdma provider range is registered the first
+ * time a range is requested that no already-registered range contains; it
+ * lives until the driver unbinds (devm), even if every exported buffer is
+ * closed meanwhile. A range that overlaps a registered one without being
+ * inside it is rejected: its struct pages would collide.
  */
-static int pci_driver_model_export_bar(struct pci_driver_model *drv, int bar_nr)
+static int pci_driver_model_export_bar(struct pci_driver_model *drv,
+				       const struct pci_model_export_req *req)
 {
 	struct pci_dev *pdev = drv->pdev;
 	DEFINE_DMA_BUF_EXPORT_INFO(info);
 	struct pci_bar_dmabuf *b;
+	struct pci_p2p_range *r;
 	struct dma_buf *dmabuf;
+	int bar_nr = req->bar;
 	resource_size_t start = pci_resource_start(pdev, bar_nr);
-	size_t len = pci_resource_len(pdev, bar_nr);
-	int fd;
+	size_t bar_len = pci_resource_len(pdev, bar_nr);
+	u64 off = req->offset;
+	u64 len;
+	int fd, ret;
 
 	if (!(pci_resource_flags(pdev, bar_nr) & IORESOURCE_MEM)) {
 		dev_err(&pdev->dev, "BAR%d is not a memory BAR\n", bar_nr);
 		return -EINVAL;
 	}
-	if (!IS_ALIGNED(start, SZ_2M) || len < SZ_2M) {
+	if (req->flags) {
+		dev_err(&pdev->dev, "BAR%d export: flags 0x%x must be 0\n",
+			bar_nr, req->flags);
+		return -EINVAL;
+	}
+	if (off >= bar_len) {
 		dev_err(&pdev->dev,
-			"BAR%d base %pa size 0x%zx: dma-buf export needs a 2 MiB aligned BAR of at least 2 MiB\n",
-			bar_nr, &start, len);
+			"BAR%d export: offset 0x%llx outside the BAR (size 0x%zx)\n",
+			bar_nr, (unsigned long long)off, bar_len);
+		return -EINVAL;
+	}
+	len = req->size ? req->size : (u64)bar_len - off;
+	/* both ends of the range must sit on a 2 MiB memory-section boundary
+	 * for pci_p2pdma_add_resource() to create the struct pages */
+	if (off + len > bar_len || !IS_ALIGNED((u64)start + off, SZ_2M) ||
+	    !IS_ALIGNED((u64)start + off + len, SZ_2M)) {
+		dev_err(&pdev->dev,
+			"BAR%d export off=0x%llx size=0x%llx: the range must fit in the BAR and start/end at 2 MiB boundaries\n",
+			bar_nr, (unsigned long long)off,
+			(unsigned long long)len);
 		return -EINVAL;
 	}
 
-	b = drv->bar_dmabufs[bar_nr];
-	if (b) {
-		/* dma_buf_fd() consumes one reference per fd; the export
-		 * reference was already handed to the first fd */
-		get_dma_buf(b->dmabuf);
-	} else {
-		b = kzalloc(sizeof(*b), GFP_KERNEL);
-		if (!b)
-			return -ENOMEM;
-		b->drv = drv;
-		b->bar_nr = bar_nr;
-		b->len = len;
+	list_for_each_entry(b, &drv->bar_dmabufs, list) {
+		if (b->bar_nr == bar_nr && b->offset == off && b->len == len) {
+			/* dma_buf_fd() consumes one reference per fd; the export
+			 * reference was already handed to the first fd */
+			get_dma_buf(b->dmabuf);
+			goto have_buffer;
+		}
+	}
 
-		if (!drv->bar_p2p_added[bar_nr]) {
-			int ret = pci_p2pdma_add_resource(pdev, bar_nr, 0, 0);
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b)
+		return -ENOMEM;
+	b->drv = drv;
+	b->bar_nr = bar_nr;
+	b->offset = off;
+	b->len = len;
 
+	/* register the range as a p2pdma provider unless an already
+	 * registered one fully contains it */
+	{
+		bool covered = false;
+
+		list_for_each_entry(r, &drv->p2p_ranges, list) {
+			if (r->bar != bar_nr)
+				continue;
+			if (off >= r->offset && off + len <= r->offset + r->size) {
+				covered = true;
+				break;
+			}
+			if (off < r->offset + r->size && r->offset < off + len) {
+				dev_err(&pdev->dev,
+					"BAR%d export off=0x%llx size=0x%llx overlaps registered p2pdma range off=0x%llx size=0x%llx without being inside it\n",
+					bar_nr, (unsigned long long)off,
+					(unsigned long long)len,
+					(unsigned long long)r->offset,
+					(unsigned long long)r->size);
+				kfree(b);
+				return -EBUSY;
+			}
+		}
+		if (!covered) {
+			ret = pci_p2pdma_add_resource(pdev, bar_nr, len, off);
 			if (ret) {
 				dev_err(&pdev->dev,
-					"pci_p2pdma_add_resource(BAR%d) failed: %d\n",
-					bar_nr, ret);
+					"pci_p2pdma_add_resource(BAR%d, off=0x%llx, size=0x%llx) failed: %d\n",
+					bar_nr, (unsigned long long)off,
+					(unsigned long long)len, ret);
 				kfree(b);
 				return ret;
 			}
-			drv->bar_p2p_added[bar_nr] = true;
+			r = kmalloc(sizeof(*r), GFP_KERNEL);
+			if (!r) {
+				kfree(b);
+				return -ENOMEM;
+			}
+			r->bar = bar_nr;
+			r->offset = off;
+			r->size = len;
+			list_add_tail(&r->list, &drv->p2p_ranges);
 		}
-		b->page = pfn_to_page(PHYS_PFN(start));
-
-		info.ops = &pci_bar_dmabuf_ops;
-		info.size = len;
-		info.priv = b;
-		/* DEFINE_DMA_BUF_EXPORT_INFO sets owner = THIS_MODULE: the
-		 * dma-buf core holds a module reference until the buffer's
-		 * release() runs, so rmmod is refused while an exported
-		 * buffer (or an MR using it) is alive */
-		dmabuf = dma_buf_export(&info);
-		if (IS_ERR(dmabuf)) {
-			int ret = PTR_ERR(dmabuf);
-
-			kfree(b);
-			return ret;
-		}
-		b->dmabuf = dmabuf;
-		drv->bar_dmabufs[bar_nr] = b;
 	}
 
+	b->page = pfn_to_page(PHYS_PFN((u64)start + off));
+
+	info.ops = &pci_bar_dmabuf_ops;
+	info.size = len;
+	info.priv = b;
+	/* DEFINE_DMA_BUF_EXPORT_INFO sets owner = THIS_MODULE: the
+	 * dma-buf core holds a module reference until the buffer's
+	 * release() runs, so rmmod is refused while an exported
+	 * buffer (or an MR using it) is alive */
+	dmabuf = dma_buf_export(&info);
+	if (IS_ERR(dmabuf)) {
+		ret = PTR_ERR(dmabuf);
+		kfree(b);
+		return ret;
+	}
+	b->dmabuf = dmabuf;
+	list_add_tail(&b->list, &drv->bar_dmabufs);
+
+have_buffer:
 	fd = dma_buf_fd(b->dmabuf, O_CLOEXEC);
 	if (fd < 0) {
 		/* drop the reference reserved for this fd */
 		dma_buf_put(b->dmabuf);
 		return fd;
 	}
-	dev_info(&pdev->dev, "BAR%d exported as dma-buf, fd=%d\n", bar_nr, fd);
+	dev_info(&pdev->dev,
+		"BAR%d off=0x%llx size=0x%llx exported as dma-buf, fd=%d\n",
+		bar_nr, (unsigned long long)off, (unsigned long long)len, fd);
 	return fd;
 }
 
@@ -671,6 +740,8 @@ static int pci_driver_model_probe(struct pci_dev *pdev, const struct pci_device_
 	kref_init(&drv_data->kref);	/* the probe reference, dropped in remove */
 	mutex_init(&drv_data->ops_lock);
 	INIT_LIST_HEAD(&drv_data->dma_regions_list);
+	INIT_LIST_HEAD(&drv_data->bar_dmabufs);
+	INIT_LIST_HEAD(&drv_data->p2p_ranges);
 	INIT_WORK(&drv_data->irq_wq, irq_work_queue_func);
 
 	pci_set_drvdata(pdev, drv_data);
@@ -792,6 +863,7 @@ static void pci_driver_model_remove(struct pci_dev *pdev)
 {
 	struct pci_driver_model *drv_data = pci_get_drvdata(pdev);
 	struct dma_region_node *node, *tmp;
+	struct pci_bar_dmabuf *db;
 	int i;
 
 	/* stop the device from DMA-ing into buffers we are about to free */
@@ -829,11 +901,10 @@ static void pci_driver_model_remove(struct pci_dev *pdev)
 	 * alive; reaching here with a live buffer means a manual sysfs unbind.
 	 * The devm p2pdma provider (its struct pages) goes away when this
 	 * returns, leaving any surviving importer with stale pages. */
-	for (i = 0; i < 6; i++)
-		if (drv_data->bar_dmabufs[i])
-			dev_warn(&pdev->dev,
-				"BAR%d dma-buf still exported; its p2pdma pages go away with this unbind\n",
-				i);
+	list_for_each_entry(db, &drv_data->bar_dmabufs, list)
+		dev_warn(&pdev->dev,
+			"BAR%d+0x%llx dma-buf still exported; its p2pdma pages go away with this unbind\n",
+			db->bar_nr, (unsigned long long)db->offset);
 	mutex_unlock(&drv_data->ops_lock);
 
 	/* the bottom half touches drv_data, so it must be gone before we drop
